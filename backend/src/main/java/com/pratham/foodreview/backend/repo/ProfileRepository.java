@@ -2,6 +2,7 @@ package com.pratham.foodreview.backend.repo;
 
 import com.pratham.foodreview.backend.entity.Profile;
 import com.pratham.foodreview.backend.entity.Review;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -15,4 +16,7 @@ public interface ProfileRepository extends JpaRepository<Profile, UUID> {
 
   @Query("SELECT r FROM Review r JOIN FETCH r.user JOIN FETCH r.restaurant WHERE r.user.id = :userId ORDER BY r.createdAt DESC")
   List<Review> findReviewsByUserId(@Param("userId") UUID userId);
+
+  @Query("SELECT p FROM Profile p WHERE p.username IS NOT NULL AND LOWER(p.username) LIKE LOWER(CONCAT(:prefix, '%')) ORDER BY p.username ASC")
+  List<Profile> findByUsernamePrefix(@Param("prefix") String prefix, Pageable pageable);
 }

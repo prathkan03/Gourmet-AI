@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
   View,
   Text,
@@ -17,6 +17,54 @@ import { supabase } from "../../src/components/services/supabase";
 import * as Location from "expo-location";
 import { router } from "expo-router";
 
+/* ------------------------------------------------------------------ */
+/*  Trie — client-side username autocomplete cache                     */
+/* ------------------------------------------------------------------ */
+
+class TrieNode {
+  children: Map<string, TrieNode> = new Map();
+  profiles: UserResult[] = []; // profiles whose username passes through this node
+}
+
+class Trie {
+  private root = new TrieNode();
+
+  insert(profile: UserResult) {
+    let node = this.root;
+    for (const ch of profile.username.toLowerCase()) {
+      if (!node.children.has(ch)) node.children.set(ch, new TrieNode());
+      node = node.children.get(ch)!;
+    }
+    // store at terminal node (avoid duplicates)
+    if (!node.profiles.find((p) => p.id === profile.id)) {
+      node.profiles.push(profile);
+    }
+  }
+
+  /** Return all profiles whose username starts with `prefix`. */
+  search(prefix: string): UserResult[] {
+    let node = this.root;
+    for (const ch of prefix.toLowerCase()) {
+      if (!node.children.has(ch)) return [];
+      node = node.children.get(ch)!;
+    }
+    // collect all profiles in the subtree
+    const results: UserResult[] = [];
+    const visited = new Set<string>();
+    const stack = [node];
+    while (stack.length) {
+      const cur = stack.pop()!;
+      for (const p of cur.profiles) {
+        if (!visited.has(p.id)) { visited.add(p.id); results.push(p); }
+      }
+      for (const child of cur.children.values()) stack.push(child);
+    }
+    return results.sort((a, b) => a.username.localeCompare(b.username)).slice(0, 20);
+  }
+}
+
+const userTrie = new Trie(); // module-level so it persists across re-renders
+
 interface SearchResult {
   provider: string;
   providerId: string;
@@ -27,6 +75,16 @@ interface SearchResult {
   rating?: number;
   priceLevel?: number;
 }
+
+interface UserResult {
+  id: string;
+  username: string;
+  displayName: string | null;
+  avatarUrl: string | null;
+  bio: string | null;
+}
+
+type SearchMode = "restaurants" | "people";
 
 interface TrendingRestaurant {
   id: string;
@@ -50,7 +108,9 @@ const TRENDING_CUISINES = [
 
 export default function SearchTab() {
   const [query, setQuery] = useState("");
+  const [mode, setMode] = useState<SearchMode>("restaurants");
   const [results, setResults] = useState<SearchResult[]>([]);
+  const [userResults, setUserResults] = useState<UserResult[]>([]);
   const [trending, setTrending] = useState<TrendingRestaurant[]>([]);
   const [loading, setLoading] = useState(false);
   const [trendingLoading, setTrendingLoading] = useState(true);
@@ -60,6 +120,7 @@ export default function SearchTab() {
     "Le Petit Bistro",
     "Vegan Burgers",
   ]);
+  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -97,6 +158,49 @@ export default function SearchTab() {
     } finally {
       setTrendingLoading(false);
     }
+  };
+
+  const searchUsers = useCallback(async (prefix: string) => {
+    if (!prefix.trim()) { setUserResults([]); return; }
+
+    // Instant suggestions from trie
+    const trieHits = userTrie.search(prefix);
+    if (trieHits.length > 0) setUserResults(trieHits);
+
+    // Fetch from server (debounced by caller)
+    try {
+      setLoading(true);
+      const API_URL = process.env.EXPO_PUBLIC_API_URL || "http://localhost:8080";
+      const res = await fetch(`${API_URL}/users/search?q=${encodeURIComponent(prefix.trim())}`);
+      if (res.ok) {
+        const data: UserResult[] = await res.json();
+        data.forEach((u) => userTrie.insert(u));
+        setUserResults(data);
+      }
+    } catch (error) {
+      console.error("User search error:", error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const handleQueryChange = (text: string) => {
+    setQuery(text);
+    if (mode === "people") {
+      // Show trie hits immediately
+      if (text.trim()) setUserResults(userTrie.search(text));
+      else setUserResults([]);
+      // Debounce the server call
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      debounceTimer.current = setTimeout(() => searchUsers(text), 300);
+    }
+  };
+
+  const handleModeSwitch = (newMode: SearchMode) => {
+    setMode(newMode);
+    setQuery("");
+    setResults([]);
+    setUserResults([]);
   };
 
   const search = async () => {
@@ -179,7 +283,7 @@ export default function SearchTab() {
     return categories.slice(0, 3).join(" • ");
   };
 
-  const isSearchActive = loading || results.length > 0;
+  const isSearchActive = loading || results.length > 0 || userResults.length > 0;
 
   const renderTrendingCard = (restaurant: TrendingRestaurant) => (
     <Pressable
@@ -259,35 +363,115 @@ export default function SearchTab() {
           </Pressable>
         </View>
 
+        {/* Mode Toggle */}
+        <View style={styles.modeToggle}>
+          <Pressable
+            style={[styles.modeBtn, mode === "restaurants" && styles.modeBtnActive]}
+            onPress={() => handleModeSwitch("restaurants")}
+          >
+            <Ionicons name="restaurant-outline" size={16} color={mode === "restaurants" ? "#FFF" : "#888"} />
+            <Text style={[styles.modeBtnText, mode === "restaurants" && styles.modeBtnTextActive]}>
+              Restaurants
+            </Text>
+          </Pressable>
+          <Pressable
+            style={[styles.modeBtn, mode === "people" && styles.modeBtnActive]}
+            onPress={() => handleModeSwitch("people")}
+          >
+            <Ionicons name="people-outline" size={16} color={mode === "people" ? "#FFF" : "#888"} />
+            <Text style={[styles.modeBtnText, mode === "people" && styles.modeBtnTextActive]}>
+              People
+            </Text>
+          </Pressable>
+        </View>
+
         {/* Search Bar */}
         <View style={styles.searchSection}>
           <View style={styles.searchBar}>
             <Ionicons name="search-outline" size={20} color="#999" />
             <TextInput
-              placeholder="Cuisine, dish, or restaurant..."
+              placeholder={mode === "people" ? "Search by username..." : "Cuisine, dish, or restaurant..."}
               value={query}
-              onChangeText={setQuery}
-              onSubmitEditing={search}
+              onChangeText={handleQueryChange}
+              onSubmitEditing={mode === "restaurants" ? search : undefined}
               returnKeyType="search"
               style={styles.searchInput}
               placeholderTextColor="#999"
+              autoCapitalize="none"
+              autoCorrect={false}
             />
+            {query.length > 0 && (
+              <Pressable onPress={() => handleQueryChange("")}>
+                <Ionicons name="close-circle" size={18} color="#CCC" />
+              </Pressable>
+            )}
           </View>
-          <Pressable style={styles.filterButton} onPress={search}>
-            <Ionicons name="options-outline" size={20} color="#FFF" />
-          </Pressable>
+          {mode === "restaurants" && (
+            <Pressable style={styles.filterButton} onPress={search}>
+              <Ionicons name="options-outline" size={20} color="#FFF" />
+            </Pressable>
+          )}
         </View>
 
         {/* Loading */}
         {loading && (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color="#FF6B35" />
-            <Text style={styles.loadingText}>Searching restaurants...</Text>
+            <Text style={styles.loadingText}>
+              {mode === "people" ? "Searching users..." : "Searching restaurants..."}
+            </Text>
+          </View>
+        )}
+
+        {/* User Results */}
+        {mode === "people" && !loading && userResults.length > 0 && (
+          <View style={styles.resultsContainer}>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitleLarge}>People</Text>
+              <Pressable onPress={() => { setUserResults([]); setQuery(""); }}>
+                <Text style={styles.clearAllText}>Clear</Text>
+              </Pressable>
+            </View>
+            {userResults.map((user) => (
+              <Pressable
+                key={user.id}
+                style={styles.userResultCard}
+                onPress={() => router.push({ pathname: "/tabs/profile", params: { userId: user.id } })}
+              >
+                <View style={styles.userAvatarWrap}>
+                  {user.avatarUrl ? (
+                    <Image source={{ uri: user.avatarUrl }} style={styles.userAvatar} />
+                  ) : (
+                    <View style={styles.userAvatarPlaceholder}>
+                      <Ionicons name="person" size={22} color="#CCC" />
+                    </View>
+                  )}
+                </View>
+                <View style={styles.userInfo}>
+                  <Text style={styles.userUsername}>@{user.username}</Text>
+                  {user.displayName ? (
+                    <Text style={styles.userDisplayName}>{user.displayName}</Text>
+                  ) : null}
+                  {user.bio ? (
+                    <Text style={styles.userBio} numberOfLines={1}>{user.bio}</Text>
+                  ) : null}
+                </View>
+                <Ionicons name="chevron-forward" size={20} color="#CCC" />
+              </Pressable>
+            ))}
+          </View>
+        )}
+
+        {/* People empty state */}
+        {mode === "people" && !loading && query.trim().length > 0 && userResults.length === 0 && (
+          <View style={styles.emptyContainer}>
+            <Ionicons name="person-outline" size={48} color="#CCC" />
+            <Text style={styles.emptyText}>No users found for "{query}"</Text>
           </View>
         )}
 
         {/* Search Results */}
-        {!loading && results.length > 0 && (
+        {mode === "restaurants" && !loading && results.length > 0 && (
           <View style={styles.resultsContainer}>
             <View style={styles.sectionHeader}>
               <Text style={styles.sectionTitleLarge}>Search Results</Text>
@@ -331,8 +515,8 @@ export default function SearchTab() {
           </View>
         )}
 
-        {/* Default view (no search active) */}
-        {!isSearchActive && (
+        {/* Default view (no search active, restaurants mode) */}
+        {mode === "restaurants" && !isSearchActive && (
           <>
             {/* Recent Searches */}
             {recentSearches.length > 0 && (
@@ -740,5 +924,81 @@ const styles = StyleSheet.create({
     fontSize: 15,
     color: "#999",
     marginTop: 10,
+  },
+
+  /* ---- Mode Toggle ---- */
+  modeToggle: {
+    flexDirection: "row",
+    marginHorizontal: 20,
+    marginBottom: 12,
+    backgroundColor: "#EDE8E3",
+    borderRadius: 12,
+    padding: 4,
+  },
+  modeBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 8,
+    borderRadius: 10,
+    gap: 6,
+  },
+  modeBtnActive: {
+    backgroundColor: "#FF6B35",
+  },
+  modeBtnText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#888",
+  },
+  modeBtnTextActive: {
+    color: "#FFF",
+  },
+
+  /* ---- User Results ---- */
+  userResultCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#FFF",
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: "#F0F0F0",
+  },
+  userAvatarWrap: {
+    marginRight: 12,
+  },
+  userAvatar: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+  },
+  userAvatarPlaceholder: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: "#F0F0F0",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  userInfo: {
+    flex: 1,
+  },
+  userUsername: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#1A1A1A",
+  },
+  userDisplayName: {
+    fontSize: 13,
+    color: "#666",
+    marginTop: 2,
+  },
+  userBio: {
+    fontSize: 12,
+    color: "#999",
+    marginTop: 2,
   },
 });
